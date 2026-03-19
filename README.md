@@ -22,6 +22,7 @@ Claude CLI (OAuth token)  -->  Plugin  -->  OpenCode
 ## Install
 
 **1.** Make sure you have:
+
 - [OpenCode](https://github.com/sst/opencode)
 - [Claude CLI](https://github.com/anthropics/claude-code) logged in (`claude auth status`)
 - Claude Pro or Max subscription
@@ -36,11 +37,7 @@ bun add opencode-anthropic-login-via-cli
 
 ```json
 {
-  "plugin": {
-    "anthropic-login": {
-      "module": "opencode-anthropic-login-via-cli"
-    }
-  }
+  "plugin": ["opencode-anthropic-login-via-cli"]
 }
 ```
 
