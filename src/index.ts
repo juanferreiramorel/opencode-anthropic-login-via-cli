@@ -2,7 +2,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { randomBytes, createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
 
@@ -50,14 +50,26 @@ async function findClaudeBinary(): Promise<string | null> {
     // Check common Windows install paths first
     const candidates = [
       join(homedir(), ".claude", "local", "claude.exe"),
-      join(homedir(), "AppData", "Local", "Programs", "claude-code", "claude.exe"),
+      join(
+        homedir(),
+        "AppData",
+        "Local",
+        "Programs",
+        "claude-code",
+        "claude.exe",
+      ),
     ];
     for (const p of candidates) {
-      try { await readFile(p); return p; } catch {}
+      try {
+        await access(p);
+        return p;
+      } catch {}
     }
     // Fallback to PATH
     try {
-      const { stdout } = await execFileAsync("where", ["claude"], { timeout: 3000 });
+      const { stdout } = await execFileAsync("where", ["claude"], {
+        timeout: 3000,
+      });
       const first = stdout.trim().split(/\r?\n/)[0];
       if (first) return first.trim();
     } catch {}
@@ -65,22 +77,29 @@ async function findClaudeBinary(): Promise<string | null> {
   }
   // Unix
   try {
-    const { stdout } = await execFileAsync("which", ["claude"], { timeout: 3000 });
+    const { stdout } = await execFileAsync("which", ["claude"], {
+      timeout: 3000,
+    });
     return stdout.trim() || null;
   } catch {
     return null;
   }
 }
 
-async function extractBetaHeadersFromBinary(binaryPath: string): Promise<string[] | null> {
+async function extractBetaHeadersFromBinary(
+  binaryPath: string,
+  binaryText?: string,
+): Promise<string[] | null> {
   if (IS_WIN) {
-    // On Windows, `strings` is not available; read the binary directly and scan for patterns
+    // On Windows, `strings` is not available; scan the binary content directly
     try {
-      const buf = await readFile(binaryPath);
-      const text = buf.toString("utf-8");
-      const pattern = /[a-z]+-(?:[a-z0-9]+-)?20\d{2}-\d{2}-\d{2}|claude-code-\d+/g;
+      const text = binaryText ?? (await readFile(binaryPath)).toString("utf-8");
+      const pattern =
+        /[a-z]+-(?:[a-z0-9]+-)?20\d{2}-\d{2}-\d{2}|claude-code-\d+/g;
       const matches = [...new Set(text.match(pattern) || [])];
-      const headers = matches.filter((h) => KNOWN_BETA_PREFIXES.some((p) => h.startsWith(p)));
+      const headers = matches.filter((h) =>
+        KNOWN_BETA_PREFIXES.some((p) => h.startsWith(p)),
+      );
       if (!headers.some((h) => h.startsWith("oauth-"))) {
         headers.push("oauth-2025-04-20");
       }
@@ -100,7 +119,9 @@ async function extractBetaHeadersFromBinary(binaryPath: string): Promise<string[
       ],
       { timeout: 30_000 },
     );
-    const headers = stdout.trim().split("\n")
+    const headers = stdout
+      .trim()
+      .split("\n")
       .filter((h) => h && KNOWN_BETA_PREFIXES.some((p) => h.startsWith(p)));
     if (!headers.some((h) => h.startsWith("oauth-"))) {
       headers.push("oauth-2025-04-20");
@@ -111,15 +132,20 @@ async function extractBetaHeadersFromBinary(binaryPath: string): Promise<string[
   }
 }
 
-async function extractScopesFromBinary(binaryPath: string): Promise<string | null> {
+async function extractScopesFromBinary(
+  binaryPath: string,
+  binaryText?: string,
+): Promise<string | null> {
   if (IS_WIN) {
     try {
-      const buf = await readFile(binaryPath);
-      const text = buf.toString("utf-8");
+      const text = binaryText ?? (await readFile(binaryPath)).toString("utf-8");
       const pattern = /(?:user|org):[a-z_:]+/g;
       const matches = [...new Set(text.match(pattern) || [])];
       const scopes = matches.filter(
-        (s) => !s.includes("this") && !s.endsWith(":") && (s.startsWith("user:") || s.startsWith("org:")),
+        (s) =>
+          !s.includes("this") &&
+          !s.endsWith(":") &&
+          (s.startsWith("user:") || s.startsWith("org:")),
       );
       return scopes.length > 0 ? scopes.join(" ") : null;
     } catch {
@@ -137,8 +163,16 @@ async function extractScopesFromBinary(binaryPath: string): Promise<string | nul
       ],
       { timeout: 30_000 },
     );
-    const scopes = stdout.trim().split("\n")
-      .filter((s) => s && !s.includes("this") && !s.endsWith(":") && (s.startsWith("user:") || s.startsWith("org:")));
+    const scopes = stdout
+      .trim()
+      .split("\n")
+      .filter(
+        (s) =>
+          s &&
+          !s.includes("this") &&
+          !s.endsWith(":") &&
+          (s.startsWith("user:") || s.startsWith("org:")),
+      );
     return scopes.length > 0 ? scopes.join(" ") : null;
   } catch {
     return null;
@@ -170,8 +204,16 @@ async function introspectClaudeBinary(): Promise<{
       };
     }
 
-    const betaHeaders = await extractBetaHeadersFromBinary(binaryPath) ?? DEFAULT_BETA_HEADERS;
-    const scopes = await extractScopesFromBinary(binaryPath) ?? DEFAULT_SCOPES;
+    // On Windows, read binary once and share the text to avoid double memory allocation
+    const binaryText = IS_WIN
+      ? (await readFile(binaryPath)).toString("utf-8")
+      : undefined;
+
+    const betaHeaders =
+      (await extractBetaHeadersFromBinary(binaryPath, binaryText)) ??
+      DEFAULT_BETA_HEADERS;
+    const scopes =
+      (await extractScopesFromBinary(binaryPath, binaryText)) ?? DEFAULT_SCOPES;
 
     return {
       version,
@@ -210,9 +252,7 @@ function base64url(buf: Buffer): string {
 
 function createAuthorizationRequest(scopes: string) {
   const verifier = base64url(randomBytes(32));
-  const challenge = base64url(
-    createHash("sha256").update(verifier).digest(),
-  );
+  const challenge = base64url(createHash("sha256").update(verifier).digest());
   const params = new URLSearchParams({
     code: "true",
     response_type: "code",
@@ -271,9 +311,7 @@ async function exchangeCodeForTokens(
 
 let refreshInFlight: Promise<OAuthTokens> | null = null;
 
-async function refreshTokens(
-  refreshToken: string,
-): Promise<OAuthTokens> {
+async function refreshTokens(refreshToken: string): Promise<OAuthTokens> {
   const res = await fetch(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -306,9 +344,7 @@ function refreshTokensSafe(refreshToken: string): Promise<OAuthTokens> {
 
 // ── Claude Code Credential Reader ────────────────────────────────────────────
 
-async function readKeychainEntry(
-  account?: string,
-): Promise<string | null> {
+async function readKeychainEntry(account?: string): Promise<string | null> {
   try {
     const args = ["find-generic-password", "-s", "Claude Code-credentials"];
     if (account) args.push("-a", account);
@@ -371,7 +407,7 @@ function isExpiringSoon(expiresAt: number): boolean {
 async function hasClaude(): Promise<boolean> {
   try {
     const cmd = IS_WIN ? "where" : "which";
-    await execFileAsync(cmd, [IS_WIN ? "claude.exe" : "claude"], { timeout: 3000 });
+    await execFileAsync(cmd, [CLAUDE_CMD], { timeout: 3000 });
     return true;
   } catch {
     return false;
@@ -504,11 +540,15 @@ function createCustomFetch(
       } else if (input instanceof Request) {
         reqUrl = new URL(input.url);
       }
-      if (reqUrl?.pathname === "/v1/messages" && !reqUrl.searchParams.has("beta")) {
+      if (
+        reqUrl?.pathname === "/v1/messages" &&
+        !reqUrl.searchParams.has("beta")
+      ) {
         reqUrl.searchParams.set("beta", "true");
-        reqInput = input instanceof Request
-          ? new Request(reqUrl.toString(), input)
-          : reqUrl;
+        reqInput =
+          input instanceof Request
+            ? new Request(reqUrl.toString(), input)
+            : reqUrl;
       }
     } catch {}
 
@@ -586,7 +626,7 @@ const plugin: Plugin = async ({ client }) => {
                   "Claude CLI not found. Install it first:\n\n" +
                   "  npm install -g @anthropic-ai/claude-code\n\n" +
                   "Then run `claude` to log in.\n" +
-                  "Or use the \"Claude Pro/Max (browser)\" method below.",
+                  'Or use the "Claude Pro/Max (browser)" method below.',
                 method: "auto" as const,
                 async callback() {
                   return { type: "failed" as const };
