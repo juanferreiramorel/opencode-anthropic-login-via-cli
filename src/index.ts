@@ -601,8 +601,14 @@ function createCustomFetch(getAuth: () => Promise<any>, client: any) {
         });
         auth.access = fresh.access;
       } catch {
-        const kc = await readClaudeCodeCredentials();
+        let kc = await readClaudeCodeCredentials();
+        // If CLI credentials are also expired, trigger a CLI refresh
+        if (!kc || isExpiringSoon(kc.expires)) {
+          kc = await refreshViaClaudeCli();
+        }
         if (kc && !isExpiringSoon(kc.expires)) {
+          refreshInFlight = null;
+          currentRefreshToken = kc.refresh;
           await client.auth.set({
             path: { id: "anthropic" },
             body: { type: "oauth", ...kc },
@@ -718,18 +724,26 @@ function createCustomFetch(getAuth: () => Promise<any>, client: any) {
       headers: reqHeaders,
     });
 
-    // On rate limit (429), check if the user switched accounts (CLI or CCS).
-    // If different credentials are found, update auth store and retry once.
-    if (response.status === 429) {
-      const altCreds = await findAlternateCredentials(auth.refresh);
-      if (altCreds) {
+    // On rate limit (429) or expired token (401), attempt recovery and retry once.
+    if (response.status === 429 || response.status === 401) {
+      let freshCreds: OAuthTokens | null = null;
+
+      // Check if the user switched accounts (CLI or CCS)
+      freshCreds = await findAlternateCredentials(auth.refresh);
+
+      // If no alternate account found, force a CLI refresh (handles expired tokens)
+      if (!freshCreds && response.status === 401) {
+        freshCreds = await refreshViaClaudeCli();
+      }
+
+      if (freshCreds && !isExpiringSoon(freshCreds.expires)) {
         refreshInFlight = null;
-        currentRefreshToken = altCreds.refresh;
+        currentRefreshToken = freshCreds.refresh;
         await client.auth.set({
           path: { id: "anthropic" },
-          body: { type: "oauth", ...altCreds },
+          body: { type: "oauth", ...freshCreds },
         });
-        reqHeaders.set("authorization", `Bearer ${altCreds.access}`);
+        reqHeaders.set("authorization", `Bearer ${freshCreds.access}`);
         response = await fetch(reqInput, {
           ...requestInit,
           body,
