@@ -542,6 +542,34 @@ async function readCCSCredentials(
   }
 }
 
+// ── Credential Re-read (all sources) ─────────────────────────────────────────
+// On rate limit, re-reads credentials from ALL sources (main CLI + CCS instances)
+// to detect if the user switched accounts. Returns the first valid credential set
+// that differs from the current one.
+
+async function findAlternateCredentials(
+  currentRefresh: string,
+): Promise<OAuthTokens | null> {
+  // Check main CLI credentials
+  const main = await readClaudeCodeCredentials();
+  if (main && main.refresh !== currentRefresh && !isExpiringSoon(main.expires)) {
+    return main;
+  }
+  // Check all CCS instances
+  const instances = await discoverCCSInstances();
+  for (const inst of instances) {
+    const creds = await readCCSCredentials(inst.credentialsPath);
+    if (
+      creds &&
+      creds.refresh !== currentRefresh &&
+      !isExpiringSoon(creds.expires)
+    ) {
+      return creds;
+    }
+  }
+  return null;
+}
+
 // ── Custom Fetch (Bearer auth + tool renaming + prompt sanitization) ─────────
 // Reads userAgent/betaHeaders from getIntro() on every request so values
 // auto-upgrade once background introspection completes.
@@ -690,22 +718,18 @@ function createCustomFetch(getAuth: () => Promise<any>, client: any) {
       headers: reqHeaders,
     });
 
-    // On rate limit (429), check if the user switched accounts in the CLI.
-    // If CLI credentials changed, update OpenCode's auth store and retry once.
+    // On rate limit (429), check if the user switched accounts (CLI or CCS).
+    // If different credentials are found, update auth store and retry once.
     if (response.status === 429) {
-      const cliCreds = await readClaudeCodeCredentials();
-      if (
-        cliCreds &&
-        cliCreds.refresh !== auth.refresh &&
-        !isExpiringSoon(cliCreds.expires)
-      ) {
+      const altCreds = await findAlternateCredentials(auth.refresh);
+      if (altCreds) {
         refreshInFlight = null;
-        currentRefreshToken = cliCreds.refresh;
+        currentRefreshToken = altCreds.refresh;
         await client.auth.set({
           path: { id: "anthropic" },
-          body: { type: "oauth", ...cliCreds },
+          body: { type: "oauth", ...altCreds },
         });
-        reqHeaders.set("authorization", `Bearer ${cliCreds.access}`);
+        reqHeaders.set("authorization", `Bearer ${altCreds.access}`);
         response = await fetch(reqInput, {
           ...requestInit,
           body,
